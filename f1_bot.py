@@ -25,9 +25,9 @@ TZ = timezone(timedelta(hours=3, minutes=30))  # ایران: ثابت +۳:۳۰ (
 # یادآوری‌ها: چند دقیقه قبل از شروع هر سشن پیام بده
 REMINDERS_MIN = [1440, 60, 15]   # ۲۴ ساعت، ۱ ساعت، ۱۵ دقیقه
 
-# پست جدول هفتگی: روز (۰=دوشنبه ... ۶=یکشنبه) و ساعت به وقت ایران
-WEEKLY_DAY = 0
-WEEKLY_HOUR = 10
+# جدول مسابقه بعدی چند دقیقه بعد از «شروع» مسابقه اصلی قبلی گذاشته بشه.
+# مسابقه معمولاً ۱.۵ تا ۲ ساعت طول می‌کشه؛ ۱۵۰ یعنی ۲ ساعت و نیم بعد از شروع.
+POST_AFTER_RACE_MIN = 150
 
 # سشن‌هایی که یادآوری بگیرن
 REMIND_SESSIONS = ["FirstPractice", "SecondPractice", "ThirdPractice",
@@ -295,15 +295,20 @@ def build_weekly_text(race):
 
 
 def check_weekly(now, sent):
-    local = now.astimezone(TZ)
-    if local.weekday() != WEEKLY_DAY or local.hour < WEEKLY_HOUR:
-        return
-    for race in get_races():
-        race_start = race["sessions"]["Race"]
-        if now < race_start <= now + timedelta(days=7):
-            sid = f"weekly-{race['round']}"
-            if sid in sent:
-                return
+    # جدول مسابقه بعدی رو درست بعد از تموم شدن مسابقه قبلی می‌ذاره
+    races = sorted(get_races(), key=lambda r: r["sessions"]["Race"])
+    for i, race in enumerate(races):
+        first_session = min(race["sessions"].values())
+        sid = f"next-{race['round']}"
+        if sid in sent or now >= first_session:
+            continue
+        if i == 0:
+            # اولین مسابقه فصل: مسابقه قبلی نداره، ۷ روز قبل از شروع می‌ذاره
+            ready = now >= first_session - timedelta(days=7)
+        else:
+            prev_start = races[i - 1]["sessions"]["Race"]
+            ready = now >= prev_start + timedelta(minutes=POST_AFTER_RACE_MIN)
+        if ready:
             if send(build_weekly_text(race)):
                 sent.add(sid)
                 save_sent(sent)
