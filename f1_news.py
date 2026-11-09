@@ -3,7 +3,7 @@
 # ۱) خبر رو از چند سایت می‌گیره  ۲) به فارسی ترجمه می‌کنه
 # ۳) پیش‌نویس (عکس + متن) رو با دکمه «تایید / رد» برای ادمین می‌فرسته
 # ۴) بعد از «تایید» همون پست رو توی کانال منتشر می‌کنه
-# فقط با کتابخونه‌های خود پایتون کار می‌کنه (بدون pip).
+# فقط با کتابخونه‌های خود پایتون کار می‌کنه (بدون pip و API پولی).
 #
 # حالت‌های اجرا:
 #   python f1_news.py          اجرای عادی (برای GitHub Actions)
@@ -29,11 +29,9 @@ from email.utils import parsedate_to_datetime
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")      # آیدی عددی خودت
 CHANNEL = os.environ.get("CHANNEL", "@formulaone_esi")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")   # اختیاری: ترجمه بهتر
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 PROXY = os.environ.get("PROXY") or None
 
-FOOTER = "@FORMULAONE_ESI"            # پایین هر پست
+FOOTER_URL = "https://t.me/formulaone_esi"
 
 # منبع‌ها. type=rss  یعنی فید RSS ، type=html یعنی خوندن صفحه لیست خبرها
 SOURCES = [
@@ -319,38 +317,45 @@ def google_tr(text):
         return ""
     url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode(
         {"client": "gtx", "sl": "en", "tl": "fa", "dt": "t", "q": text})
-    data = json.loads(http_get(url).decode("utf-8"))
-    return "".join(seg[0] for seg in data[0] if seg and seg[0]).strip()
+    last_error = None
+    for attempt in range(3):
+        try:
+            data = json.loads(http_get(url, timeout=30).decode("utf-8"))
+            return "".join(seg[0] for seg in data[0] if seg and seg[0]).strip()
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Google Translate موقتاً پاسخ نداد: {last_error}")
 
 
-def claude_tr(title, summary):
-    prompt = (
-        "You translate Formula 1 news into Persian (Farsi) for a Telegram channel.\n"
-        "Rules: be faithful and natural, do not add facts, keep it concise. Use the Persian "
-        "spellings of driver/team/circuit names that Persian F1 media use. Keep acronyms "
-        "such as FIA, DRS, F1 in Latin letters.\n"
-        'Return ONLY JSON: {"title": "...", "summary": "..."} (summary may be empty).\n\n'
-        f"TITLE: {title}\nSUMMARY: {summary}")
-    body = json.dumps({"model": CLAUDE_MODEL, "max_tokens": 800,
-                       "messages": [{"role": "user", "content": prompt}]}).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=body,
-        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"})
-    with _opener().open(req, timeout=60) as r:
-        resp = json.loads(r.read().decode())
-    text = "".join(b.get("text", "") for b in resp.get("content", []))
-    obj = json.loads(text[text.index("{"): text.rindex("}") + 1])
-    return obj["title"].strip(), (obj.get("summary") or "").strip()
+# واژه‌نامهٔ سبک برای یکدست شدن نام‌ها و اصطلاحات رایج F1 بعد از ترجمهٔ رایگان.
+# ترجمهٔ ماشینی رایگان است؛ این جایگزینی‌ها فقط خروجی را یکدست‌تر می‌کنند.
+F1_GLOSSARY = {
+    "لوئیس همیلتون": "لوئیس همیلتون", "لوییس همیلتون": "لوئیس همیلتون",
+    "مکس ورستاپن": "مکس فرستاپن", "ماکس ورستاپن": "مکس فرستاپن",
+    "چارلز لکلرک": "شارل لکلرک",
+    "لاندو نوریس": "لندو نوریس", "لندو نوریس": "لندو نوریس",
+    "اسکار پیاستری": "اسکار پیاستری", "فرناندو آلونسو": "فرناندو آلونسو",
+    "کارلوس ساینز": "کارلوس ساینز", "جورج راسل": "جورج راسل",
+    "رد بول": "ردبول", "ردبول ریسینگ": "ردبول", "مک لارن": "مک‌لارن",
+    "مک‌لارن": "مک‌لارن", "مرسدس": "مرسدس", "فراری": "فراری",
+    "گرندپری": "گرندپری", "جایزه بزرگ": "گرندپری",
+    "تمرین آزاد": "تمرین آزاد", "مرحله تعیین خط": "دور تعیین خط",
+    "تعیین صلاحیت": "دور تعیین خط", "پیت استاپ": "پیت‌استاپ",
+}
+
+
+def polish_f1_translation(text):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    for wrong, right in F1_GLOSSARY.items():
+        text = re.sub(re.escape(wrong), right, text, flags=re.I)
+    return text
 
 
 def translate(title, summary):
-    if ANTHROPIC_API_KEY:
-        try:
-            return claude_tr(title, summary)
-        except Exception as e:
-            print("Claude translation failed, falling back to Google:", e)
-    return google_tr(title), google_tr(summary)
+    """ترجمهٔ رایگان؛ بدون نیاز به کلید API یا سرویس پولی."""
+    return polish_f1_translation(google_tr(title)), polish_f1_translation(google_tr(summary))
 
 
 # ====================== ساخت پست ======================
@@ -362,8 +367,9 @@ def build_caption(fa_title, fa_summary, source):
     def make(summ):
         parts = [f"📰 <b>{e(fa_title)}</b>"]
         if summ:
-            parts.append(e(summ))
-        parts.append(f"منبع: {e(source)}\n{FOOTER}")
+            parts.append(f"<blockquote><b>{e(summ)}</b></blockquote>")
+        parts.append(f"منبع: {e(source)}")
+        parts.append(f'<a href="{FOOTER_URL}">⚪️ FORMULAONEESI ⚪️</a>')
         return "\n\n".join(parts)
 
     summ = fa_summary
@@ -373,6 +379,9 @@ def build_caption(fa_title, fa_summary, source):
         if len(summ) < 20:
             summ = ""
         cap = make(summ)
+    # طول عنوان و قالب ثابت باید زیر محدودیت کپشن تلگرام بماند.
+    if len(cap) > 1024:
+        cap = make("")
     return cap[:1024]
 
 
@@ -463,53 +472,76 @@ def _status_markup(text):
     return json.dumps({"inline_keyboard": [[{"text": text, "callback_data": "noop"}]]})
 
 
+def _done_key(chat_id, message_id):
+    return f"{chat_id}:{message_id}"
+
+
 def handle_update(upd, st):
+    """True یعنی update با موفقیت رسیدگی شد؛ False یعنی باید دوباره امتحان شود."""
     msg = upd.get("message")
     if msg and str(msg.get("chat", {}).get("id")) == str(ADMIN_CHAT_ID):
         if (msg.get("text") or "").strip().lower() in ("/start", "/id"):
             tg("sendMessage", {"chat_id": msg["chat"]["id"],
                                "text": f"Chat ID: {msg['chat']['id']}"})
-        return
+        return True
 
     cb = upd.get("callback_query")
     if not cb:
-        return
-    cb_id = cb["id"]
-    if str(cb["from"]["id"]) != str(ADMIN_CHAT_ID):
+        return True
+    cb_id = cb.get("id")
+    if str(cb.get("from", {}).get("id")) != str(ADMIN_CHAT_ID):
         tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": "دسترسی ندارید"})
-        return
+        return True
     m = cb.get("message")
     if not m:
         tg("answerCallbackQuery", {"callback_query_id": cb_id})
-        return
-    mid, chat_id, data = m["message_id"], m["chat"]["id"], cb.get("data")
+        return True
+
+    mid = m.get("message_id")
+    chat_id = m.get("chat", {}).get("id")
+    data = cb.get("data")
+    key = _done_key(chat_id, mid)
+    # سازگاری با state قدیمی که فقط message_id را ذخیره می‌کرد.
+    if key in st["done"] or mid in st["done"]:
+        tg("answerCallbackQuery", {"callback_query_id": cb_id,
+                                    "text": "این خبر قبلاً تعیین تکلیف شده است"})
+        return True
 
     if data == "noop":
         tg("answerCallbackQuery", {"callback_query_id": cb_id})
-        return
-    if mid in st["done"]:
-        tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": "قبلاً انجام شده"})
-        return
+        return True
 
     if data == "ok":
-        r = tg("copyMessage", {"chat_id": CHANNEL, "from_chat_id": chat_id, "message_id": mid})
-        if r.get("ok"):
-            st["done"].append(mid)
-            tg("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": mid,
-                                          "reply_markup": _status_markup("✅ منتشر شد")})
-            tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": "منتشر شد ✅"})
-            print("  published message", mid)
-        else:
-            err = str(r.get("description"))[:150]
+        # در صورت خطای موقت، update را مصرف نمی‌کنیم تا اجرای بعدی دوباره امتحان کند.
+        r = tg("copyMessage", {"chat_id": CHANNEL, "from_chat_id": chat_id,
+                                "message_id": mid})
+        if not r.get("ok"):
+            err = str(r.get("description") or "خطای نامشخص")[:180]
             tg("answerCallbackQuery", {"callback_query_id": cb_id,
-                                       "text": f"خطا در انتشار: {err}", "show_alert": "true"})
-            print("  publish failed:", err)
-    elif data == "no":
-        st["done"].append(mid)
+                                       "text": f"انتشار انجام نشد؛ دوباره تلاش می‌کنم. {err}",
+                                       "show_alert": "true"})
+            print("  publish failed; update will be retried:", err)
+            return False
+
+        # ثبت فوری نتیجه برای کاهش احتمال انتشار تکراری در اجرای بعدی.
+        st["done"].append(key)
+        save_state(st)
+        tg("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": mid,
+                                      "reply_markup": _status_markup("✅ منتشر شد")})
+        tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": "منتشر شد ✅"})
+        print("  published message", mid)
+        return True
+
+    if data == "no":
+        st["done"].append(key)
+        save_state(st)
         tg("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": mid,
                                       "reply_markup": _status_markup("❌ رد شد")})
         tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": "رد شد"})
-        print("  rejected message", mid)
+        return True
+
+    tg("answerCallbackQuery", {"callback_query_id": cb_id})
+    return True
 
 
 def process_updates(st, timeout=0):
@@ -520,15 +552,20 @@ def process_updates(st, timeout=0):
         print("getUpdates failed:", r.get("description"))
         time.sleep(3)
         return 0
+
     n = 0
     for upd in r.get("result", []):
         try:
-            handle_update(upd, st)
+            handled = handle_update(upd, st)
         except Exception as e:
-            print("update error:", e)
+            print("update error; will retry:", e)
+            handled = False
+        if not handled:
+            # تلگرام updateها را تا جلو رفتن offset نگه می‌دارد.
+            # توقف اینجا مانع رد شدن از روی درخواست ناموفق می‌شود.
+            break
         st["offset"] = upd["update_id"] + 1
         n += 1
-    if n:
         save_state(st)
     return n
 
