@@ -6,7 +6,8 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "run = normal, check = test reading the sites, test = send a test draft"
+        description: "run = دریافت و انتشار خبر، check = بررسی منابع، test = ارسال پیام آزمایشی به کانال"
+        required: true
         default: "run"
         type: choice
         options:
@@ -26,29 +27,43 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Run news bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CHANNEL: "@formulaone_esi"
         run: python f1_news.py ${{ inputs.mode || 'run' }}
 
       - name: Save state
         if: ${{ always() }}
         run: |
-          if [ -n "$(git status --porcelain news_state.json)" ]; then
+          set -e
+          if [ -n "$(git status --porcelain -- news_state.json)" ]; then
             git config user.name "f1-bot"
             git config user.email "f1-bot@users.noreply.github.com"
             git add news_state.json
             git commit -m "update news state"
+
             for i in 1 2 3; do
-              git pull --rebase origin main && git push && break
+              if git pull --rebase origin main && git push origin HEAD:main; then
+                echo "News state saved."
+                exit 0
+              fi
+              git rebase --abort || true
               sleep 3
             done
+
+            echo "ERROR: Could not save news_state.json to GitHub."
+            exit 1
+          else
+            echo "No state changes to save."
           fi
