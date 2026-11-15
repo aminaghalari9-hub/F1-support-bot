@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # ربات خبر فرمول یک
 # ۱) خبر رو از چند سایت می‌گیره  ۲) به فارسی ترجمه می‌کنه
-# ۳) پیش‌نویس (عکس + متن) رو با دکمه «تایید / رد» برای ادمین می‌فرسته
-# ۴) بعد از «تایید» همون پست رو توی کانال منتشر می‌کنه
+# ۳) خبرهای جدید را مستقیم در کانال منتشر می‌کند
 # فقط با کتابخونه‌های خود پایتون کار می‌کنه (بدون pip و API پولی).
 #
 # حالت‌های اجرا:
 #   python f1_news.py          اجرای عادی (برای GitHub Actions)
 #   python f1_news.py check    فقط چک می‌کنه سایت‌ها خونده می‌شن (چیزی نمی‌فرسته)
-#   python f1_news.py test     یه پیش‌نویس تستی برای ادمین می‌فرسته
+#   python f1_news.py test     یک پیام آزمایشی مستقیماً در کانال منتشر می‌کند
 
 import hashlib
 import html
@@ -27,7 +26,6 @@ from email.utils import parsedate_to_datetime
 # ====================== تنظیمات ======================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")      # آیدی عددی خودت
 CHANNEL = os.environ.get("CHANNEL", "@formulaone_esi")
 PROXY = os.environ.get("PROXY") or None
 
@@ -41,13 +39,12 @@ SOURCES = [
      "url": "https://www.motorsport.com/rss/f1/news/", "require": "/f1/"},
     {"name": "RacingNews365", "type": "html",
      "url": "https://racingnews365.com/f1-news", "base": "https://racingnews365.com"},
+    # فید RSS فارسی سایت فرمول یک ایران
+    {"name": "F1Iran", "type": "rss", "url": "https://f1iran.com/feed", "language": "fa"},
 ]
 
 MAX_AGE_HOURS = int(os.environ.get("MAX_AGE_HOURS", "6"))      # خبرهای قدیمی‌تر نادیده گرفته می‌شن
-MAX_NEW_PER_RUN = int(os.environ.get("MAX_NEW_PER_RUN", "3"))  # حداکثر پیش‌نویس در هر اجرا
-# بعد از ارسال پیش‌نویس، چند ثانیه منتظر زدن دکمه می‌مونه (۰ = منتظر نمی‌مونه).
-# دکمه‌هایی که بعداً زده بشن توی اجرای بعدی (حداکثر ~۵ دقیقه بعد) پردازش می‌شن.
-APPROVAL_WAIT_SECONDS = int(os.environ.get("APPROVAL_WAIT_SECONDS", "120"))
+MAX_NEW_PER_RUN = int(os.environ.get("MAX_NEW_PER_RUN", "3"))  # حداکثر خبر در هر اجرا
 SUMMARY_CHARS = 300                   # طول خلاصه انگلیسی قبل از ترجمه
 
 EXCLUDE_TITLE = re.compile(r"\b(formula e|indycar|nascar|motogp|wrc|wec)\b", re.I)
@@ -147,11 +144,12 @@ def item_id(url):
 
 
 _STOP = set("the a an of to in for on at and is are as with after by from his her its this "
-            "that be has have will could would says say over into out up new".split())
+            "that be has have will could would says say over into out up new و از به در را با برای که این آن یک پس تا هم اما".split())
 
 
 def tokens(title):
-    words = re.findall(r"[a-z0-9']+", title.lower())
+    # پشتیبانی از عنوان‌های فارسی و انگلیسی برای تشخیص خبرهای تکراری
+    words = re.findall(r"[a-z0-9آ-یءئٔ‌']+", title.lower())
     return sorted({w for w in words if w not in _STOP and len(w) > 2})
 
 
@@ -361,14 +359,18 @@ def translate(title, summary):
 # ====================== ساخت پست ======================
 
 
-def build_caption(fa_title, fa_summary, source):
+def build_caption(fa_title, fa_summary, source, source_url=""):
     e = html.escape
 
     def make(summ):
         parts = [f"📰 <b>{e(fa_title)}</b>"]
         if summ:
             parts.append(f"<blockquote><b>{e(summ)}</b></blockquote>")
-        parts.append(f"منبع: {e(source)}")
+        if source_url:
+            safe_url = html.escape(source_url, quote=True)
+            parts.append(f'منبع: <a href="{safe_url}">{e(source)}</a>')
+        else:
+            parts.append(f"منبع: {e(source)}")
         parts.append(f'<a href="{FOOTER_URL}">⚪️ FORMULAONEESI ⚪️</a>')
         return "\n\n".join(parts)
 
@@ -379,37 +381,32 @@ def build_caption(fa_title, fa_summary, source):
         if len(summ) < 20:
             summ = ""
         cap = make(summ)
-    # طول عنوان و قالب ثابت باید زیر محدودیت کپشن تلگرام بماند.
     if len(cap) > 1024:
         cap = make("")
     return cap[:1024]
 
 
-DRAFT_MARKUP = json.dumps({"inline_keyboard": [[
-    {"text": "✅ تایید", "callback_data": "ok"},
-    {"text": "❌ رد", "callback_data": "no"},
-]]})
-
-
-def send_draft(caption, image):
+def publish_post(caption, image):
+    """انتشار مستقیم در کانال؛ در صورت شکست عکس، متن به‌تنهایی ارسال می‌شود."""
     if image:
-        r = tg("sendPhoto", {"chat_id": ADMIN_CHAT_ID, "photo": image, "caption": caption,
-                             "parse_mode": "HTML", "reply_markup": DRAFT_MARKUP})
+        r = tg("sendPhoto", {"chat_id": CHANNEL, "photo": image, "caption": caption,
+                             "parse_mode": "HTML"})
         if r.get("ok"):
-            return r["result"]["message_id"]
-        print("  sendPhoto failed, sending text only:", r.get("description"))
-    r = tg("sendMessage", {"chat_id": ADMIN_CHAT_ID, "text": caption, "parse_mode": "HTML",
-                           "disable_web_page_preview": "true", "reply_markup": DRAFT_MARKUP})
+            return r["result"].get("message_id")
+        print("  sendPhoto failed, falling back to text:", r.get("description"))
+    r = tg("sendMessage", {"chat_id": CHANNEL, "text": caption, "parse_mode": "HTML",
+                           "disable_web_page_preview": "true"})
     if r.get("ok"):
-        return r["result"]["message_id"]
-    print("  sendMessage failed:", r.get("description"))
+        return r["result"].get("message_id")
+    print("  channel publish failed:", r.get("description"))
     return None
 
 
-# ====================== پیدا کردن خبر جدید و ارسال پیش‌نویس ======================
+# ====================== پیدا کردن خبر جدید و انتشار مستقیم ======================
 
 
-def new_drafts(st):
+def new_posts(st):
+    """خبرهای تازه را بدون مرحله تأیید مستقیماً در کانال منتشر می‌کند."""
     seen = set(st["seen"])
     now = datetime.now(timezone.utc)
     items = fetch_all(seen)
@@ -420,7 +417,7 @@ def new_drafts(st):
             continue
         pub = it["published"]
         if pub and now - pub > timedelta(hours=MAX_AGE_HOURS):
-            seen.add(it["id"])          # قدیمی: دیگه بررسی نشه
+            seen.add(it["id"])
             st["seen"].append(it["id"])
             continue
         if EXCLUDE_TITLE.search(it["title"]):
@@ -429,145 +426,53 @@ def new_drafts(st):
             continue
         fresh.append(it)
 
-    fresh.sort(key=lambda i: i["published"] or now)      # قدیمی‌تر اول
+    fresh.sort(key=lambda i: i["published"] or now)
     sent = 0
     for it in fresh:
         if sent >= MAX_NEW_PER_RUN:
             break
         tk = tokens(it["title"])
-        if any(is_similar(tk, old) for old in st["titles"]):
+        if tk and any(is_similar(tk, old) for old in st["titles"]):
             print("  duplicate story, skipped:", it["title"])
             seen.add(it["id"])
             st["seen"].append(it["id"])
             continue
 
-        summary_en = make_summary(it["summary_raw"])
-        if summary_en.lower().startswith(it["title"].lower()[:40]):
-            summary_en = ""
         try:
-            fa_title, fa_summary = translate(it["title"], summary_en)
+            if it.get("language") == "fa" or it.get("source") == "F1Iran":
+                # خبر F1Iran از ابتدا فارسی است؛ دوباره از مترجم عبور نمی‌کند.
+                fa_title = clean_html(it["title"])
+                fa_summary = make_summary(it["summary_raw"], 520)
+            else:
+                summary_en = make_summary(it["summary_raw"])
+                if summary_en.lower().startswith(it["title"].lower()[:40]):
+                    summary_en = ""
+                fa_title, fa_summary = translate(it["title"], summary_en)
         except Exception as e:
-            print("  translation failed, will retry next run:", e)
-            continue
-        if not fa_title:
+            print("  preparing news failed, will retry next run:", e)
             continue
 
-        image = it["image"] or og_image(it["link"])
-        caption = build_caption(fa_title, fa_summary, it["source"])
-        mid = send_draft(caption, image)
+        if not fa_title:
+            continue
+        # تشخیص خبر تکراری بین منبع انگلیسی و فارسی با مقایسه عنوان فارسی‌شده
+        fa_tokens = tokens(fa_title)
+        if fa_tokens and any(is_similar(fa_tokens, old) for old in st["titles"]):
+            print("  translated duplicate story, skipped:", fa_title)
+            seen.add(it["id"])
+            st["seen"].append(it["id"])
+            continue
+        image = it.get("image") or og_image(it["link"])
+        caption = build_caption(fa_title, fa_summary, it["source"], it["link"])
+        mid = publish_post(caption, image)
         if mid:
             sent += 1
             seen.add(it["id"])
             st["seen"].append(it["id"])
-            st["titles"].append(tk)
-            print("  draft sent:", it["title"])
+            if fa_tokens:
+                st["titles"].append(fa_tokens)
+            print("  published:", it["title"], "(message", mid, ")")
             save_state(st)
     return sent
-
-
-# ====================== دکمه‌های تایید / رد ======================
-
-
-def _status_markup(text):
-    return json.dumps({"inline_keyboard": [[{"text": text, "callback_data": "noop"}]]})
-
-
-def _done_key(chat_id, message_id):
-    return f"{chat_id}:{message_id}"
-
-
-def handle_update(upd, st):
-    """True یعنی update با موفقیت رسیدگی شد؛ False یعنی باید دوباره امتحان شود."""
-    msg = upd.get("message")
-    if msg and str(msg.get("chat", {}).get("id")) == str(ADMIN_CHAT_ID):
-        if (msg.get("text") or "").strip().lower() in ("/start", "/id"):
-            tg("sendMessage", {"chat_id": msg["chat"]["id"],
-                               "text": f"Chat ID: {msg['chat']['id']}"})
-        return True
-
-    cb = upd.get("callback_query")
-    if not cb:
-        return True
-    cb_id = cb.get("id")
-    if str(cb.get("from", {}).get("id")) != str(ADMIN_CHAT_ID):
-        tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": "دسترسی ندارید"})
-        return True
-    m = cb.get("message")
-    if not m:
-        tg("answerCallbackQuery", {"callback_query_id": cb_id})
-        return True
-
-    mid = m.get("message_id")
-    chat_id = m.get("chat", {}).get("id")
-    data = cb.get("data")
-    key = _done_key(chat_id, mid)
-    # سازگاری با state قدیمی که فقط message_id را ذخیره می‌کرد.
-    if key in st["done"] or mid in st["done"]:
-        tg("answerCallbackQuery", {"callback_query_id": cb_id,
-                                    "text": "این خبر قبلاً تعیین تکلیف شده است"})
-        return True
-
-    if data == "noop":
-        tg("answerCallbackQuery", {"callback_query_id": cb_id})
-        return True
-
-    if data == "ok":
-        # در صورت خطای موقت، update را مصرف نمی‌کنیم تا اجرای بعدی دوباره امتحان کند.
-        r = tg("copyMessage", {"chat_id": CHANNEL, "from_chat_id": chat_id,
-                                "message_id": mid})
-        if not r.get("ok"):
-            err = str(r.get("description") or "خطای نامشخص")[:180]
-            tg("answerCallbackQuery", {"callback_query_id": cb_id,
-                                       "text": f"انتشار انجام نشد؛ دوباره تلاش می‌کنم. {err}",
-                                       "show_alert": "true"})
-            print("  publish failed; update will be retried:", err)
-            return False
-
-        # ثبت فوری نتیجه برای کاهش احتمال انتشار تکراری در اجرای بعدی.
-        st["done"].append(key)
-        save_state(st)
-        tg("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": mid,
-                                      "reply_markup": _status_markup("✅ منتشر شد")})
-        tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": "منتشر شد ✅"})
-        print("  published message", mid)
-        return True
-
-    if data == "no":
-        st["done"].append(key)
-        save_state(st)
-        tg("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": mid,
-                                      "reply_markup": _status_markup("❌ رد شد")})
-        tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": "رد شد"})
-        return True
-
-    tg("answerCallbackQuery", {"callback_query_id": cb_id})
-    return True
-
-
-def process_updates(st, timeout=0):
-    r = tg("getUpdates", {"offset": st["offset"], "timeout": timeout,
-                          "allowed_updates": json.dumps(["callback_query", "message"])},
-           timeout=timeout + 20)
-    if not r.get("ok"):
-        print("getUpdates failed:", r.get("description"))
-        time.sleep(3)
-        return 0
-
-    n = 0
-    for upd in r.get("result", []):
-        try:
-            handled = handle_update(upd, st)
-        except Exception as e:
-            print("update error; will retry:", e)
-            handled = False
-        if not handled:
-            # تلگرام updateها را تا جلو رفتن offset نگه می‌دارد.
-            # توقف اینجا مانع رد شدن از روی درخواست ناموفق می‌شود.
-            break
-        st["offset"] = upd["update_id"] + 1
-        n += 1
-        save_state(st)
-    return n
 
 
 # ====================== اجرا ======================
@@ -583,30 +488,25 @@ def check_mode():
 
 
 def test_mode():
-    caption = build_caption("این یک خبر تستی است", "اگر این پیام را می‌بینی، ربات درست کار می‌کند.",
-                            "Test")
-    mid = send_draft(caption, "")
-    print("test draft sent" if mid else "test draft FAILED")
+    caption = build_caption("این یک خبر آزمایشی است", "انتشار مستقیم ربات در کانال فعال است.",
+                            "Test", FOOTER_URL)
+    mid = publish_post(caption, "")
+    print("test post published" if mid else "test post FAILED")
 
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "run"
-    if not BOT_TOKEN or not ADMIN_CHAT_ID:
-        print("BOT_TOKEN و ADMIN_CHAT_ID باید تنظیم بشن.")
+    if not BOT_TOKEN:
+        print("BOT_TOKEN باید در Secrets تنظیم شده باشد.")
         sys.exit(1)
     if mode == "check":
         return check_mode()
+    st = load_state()
     if mode == "test":
         test_mode()
-        # دکمه‌ها رو هم برای تست پردازش می‌کنیم
-    st = load_state()
-    process_updates(st)                 # دکمه‌هایی که بین دو اجرا زده شدن
-    if mode == "run":
-        new_drafts(st)
-    end = time.time() + APPROVAL_WAIT_SECONDS
-    while time.time() < end:
-        process_updates(st, timeout=int(max(1, min(25, end - time.time()))))
-    process_updates(st)
+        return
+    count = new_posts(st)
+    print(f"Published {count} new posts.")
     save_state(st)
 
 
