@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # ربات خبر فرمول یک
-# ۱) خبر رو از چند سایت می‌گیره  ۲) به فارسی ترجمه می‌کنه
-# ۳) خبرهای جدید را مستقیم در کانال منتشر می‌کند
-# فقط با کتابخونه‌های خود پایتون کار می‌کنه (بدون pip و API پولی).
+# هر چند ساعت یک‌بار (پیش‌فرض ۵ ساعت) جدیدترین خبرها رو از چند سایت می‌گیره،
+# به فارسی ترجمه می‌کنه و مستقیم توی کانال منتشر می‌کنه.
+# با فرمان‌های /news_off و /news_on (توی چت خود ربات) خاموش و روشن می‌شه.
+# فقط با کتابخونه‌های خود پایتون کار می‌کنه (بدون pip).
 #
 # حالت‌های اجرا:
 #   python f1_news.py          اجرای عادی (برای GitHub Actions)
-#   python f1_news.py check    فقط چک می‌کنه سایت‌ها خونده می‌شن (چیزی نمی‌فرسته)
+#   python f1_news.py now      بدون صبر کردن برای زمان‌بندی همین الان منتشر می‌کنه
+#   python f1_news.py check    فقط سایت‌ها و ترجمه رو چک می‌کنه (چیزی منتشر نمی‌کنه)
 #   python f1_news.py test     یک پیام آزمایشی مستقیماً در کانال منتشر می‌کند
 
 import hashlib
@@ -28,6 +30,16 @@ from email.utils import parsedate_to_datetime
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL = os.environ.get("CHANNEL", "@formulaone_esi")
 PROXY = os.environ.get("PROXY") or None
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")     # آیدی عددی خودت؛ برای فرمان‌های روشن/خاموش
+
+# ترجمه با Gemini (رایگان): کلید رو از aistudio.google.com بگیر و توی Secrets بذار.
+# اگه کلید نباشه یا خطا بده، از مترجم رایگان گوگل استفاده می‌شه (کیفیت پایین‌تر).
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# اگه مدلی خطا یا محدودیت داد، بعدی امتحان می‌شه؛ اگه همه نبودن، لیست مدل‌ها از خود گوگل پرسیده می‌شه
+GEMINI_MODELS = [m for m in os.environ.get(
+    "GEMINI_MODELS", "gemini-2.5-flash,gemini-flash-latest,gemini-2.5-flash-lite,gemini-2.0-flash"
+).split(",") if m]
+IRAN = timezone(timedelta(hours=3, minutes=30))
 
 FOOTER_URL = "https://t.me/formulaone_esi"
 
@@ -43,8 +55,9 @@ SOURCES = [
     {"name": "F1Iran", "type": "rss", "url": "https://f1iran.com/feed", "language": "fa"},
 ]
 
-MAX_AGE_HOURS = int(os.environ.get("MAX_AGE_HOURS", "6"))      # خبرهای قدیمی‌تر نادیده گرفته می‌شن
-MAX_NEW_PER_RUN = int(os.environ.get("MAX_NEW_PER_RUN", "3"))  # حداکثر خبر در هر اجرا
+POST_INTERVAL_HOURS = float(os.environ.get("POST_INTERVAL_HOURS", "5"))  # فاصله بین دو نوبت انتشار
+POSTS_PER_SLOT = int(os.environ.get("POSTS_PER_SLOT", "3"))    # در هر نوبت چند خبر (جدیدترین‌ها)
+MAX_WINDOW_HOURS = 12                 # حتی بعد از خاموشی طولانی، خبر قدیمی‌تر از این منتشر نمی‌شه
 SUMMARY_CHARS = 300                   # طول خلاصه انگلیسی قبل از ترجمه
 
 EXCLUDE_TITLE = re.compile(r"\b(formula e|indycar|nascar|motogp|wrc|wec)\b", re.I)
@@ -88,7 +101,8 @@ def tg(method, params=None, timeout=30):
 
 
 def load_state():
-    st = {"seen": [], "titles": [], "offset": 0, "done": []}
+    st = {"seen": [], "titles": [], "offset": 0, "done": [],
+          "enabled": True, "last_post": "", "cmds_set": False}
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -351,8 +365,102 @@ def polish_f1_translation(text):
     return text
 
 
+TRANSLATE_PROMPT = (
+    "You are a professional Persian (Farsi) sports journalist who translates Formula 1 news "
+    "for a popular Telegram channel.\n"
+    "Write natural, fluent, idiomatic Persian news style (not word-for-word). Be faithful: never "
+    "add, remove or change facts, numbers, names or quotes. Headline: short and punchy. "
+    "Summary: at most 2-3 short sentences.\n"
+    "Use the Persian spellings Persian F1 media use for names (e.g. لوئیس همیلتون، مکس فرستاپن، "
+    "شارل لکلرک، لندو نوریس، جورج راسل، اسکار پیاستری، کیمی آنتونلی، فراری، مرسدس، مک‌لارن، ردبول). "
+    "Common terms: pole position = پول‌پوزیشن, qualifying = کوالیفای, practice = تمرین آزاد, "
+    "grid penalty = پنالتی گرید, safety car = سیفتی‌کار, pit stop = پیت‌استاپ, "
+    "Grand Prix = گرندپری, constructors' championship = قهرمانی سازندگان, "
+    "drivers' championship = قهرمانی رانندگان, power unit = پاور یونیت, "
+    "stewards = کمیسرها. Keep acronyms like FIA, DRS, F1 in Latin letters.\n"
+    'Return ONLY JSON: {"title": "...", "summary": "..."} (summary may be empty).\n\n'
+    "Example input:\nTITLE: Hamilton hit with grid penalty for Brazilian GP\n"
+    "SUMMARY: The Ferrari driver will start from the back after taking a new engine.\n"
+    'Example output:\n{"title": "همیلتون در گرندپری برزیل پنالتی گرید گرفت", '
+    '"summary": "راننده فراری پس از استفاده از موتور جدید از انتهای گرید استارت می‌زند."}\n\n')
+
+LAST_PROVIDER = ""
+_BAD_MODELS = set()      # مدل‌هایی که در این اجرا خطا دادن؛ دوباره امتحان نمی‌شن
+
+
+def _parse_tr_json(text):
+    obj = json.loads(text[text.index("{"): text.rindex("}") + 1])
+    return obj["title"].strip(), (obj.get("summary") or "").strip()
+
+
+def _gemini_call(model, prompt):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3},
+    }).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"})
+    with _opener().open(req, timeout=60) as r:
+        resp = json.loads(r.read().decode())
+    return resp["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def _gemini_discover():
+    # اگه اسم مدل‌ها عوض شده باشه، مدل‌های flash فعلی رو از خود گوگل می‌پرسه
+    req = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100",
+        headers={"x-goog-api-key": GEMINI_API_KEY})
+    with _opener().open(req, timeout=30) as r:
+        data = json.loads(r.read().decode())
+    names = []
+    for m in data.get("models", []):
+        n = m.get("name", "").replace("models/", "")
+        if ("flash" in n and "generateContent" in m.get("supportedGenerationMethods", [])
+                and not re.search(r"image|tts|live|audio|embedding|thinking|exp", n)):
+            names.append(n)
+    return sorted(names, reverse=True)[:3]
+
+
+def gemini_tr(title, summary):
+    prompt = TRANSLATE_PROMPT + f"TITLE: {title}\nSUMMARY: {summary}"
+    tried, last = [], None
+    candidates = list(GEMINI_MODELS)
+    for attempt in range(2):
+        for model in candidates:
+            if model in tried or model in _BAD_MODELS:
+                continue
+            tried.append(model)
+            try:
+                t, sm = _parse_tr_json(_gemini_call(model, prompt))
+                return t, sm, model
+            except urllib.error.HTTPError as e:
+                last = f"{model}: HTTP {e.code}"
+                _BAD_MODELS.add(model)
+            except Exception as e:
+                last = f"{model}: {e}"
+            print("  Gemini failed ->", last)
+        if attempt == 0:
+            try:
+                candidates = _gemini_discover()
+            except Exception as e:
+                print("  Gemini model discovery failed:", e)
+                break
+    raise RuntimeError(last or "gemini failed")
+
+
 def translate(title, summary):
-    """ترجمهٔ رایگان؛ بدون نیاز به کلید API یا سرویس پولی."""
+    global LAST_PROVIDER
+    if GEMINI_API_KEY:
+        try:
+            t, sm, model = gemini_tr(title, summary)
+            if t:
+                LAST_PROVIDER = f"Gemini ({model})"
+                return t, sm
+        except Exception as e:
+            print("Gemini translation failed, falling back to Google Translate:", e)
+    LAST_PROVIDER = "Google Translate (رایگان، کیفیت پایین‌تر)"
     return polish_f1_translation(google_tr(title)), polish_f1_translation(google_tr(summary))
 
 
@@ -405,8 +513,14 @@ def publish_post(caption, image):
 # ====================== پیدا کردن خبر جدید و انتشار مستقیم ======================
 
 
-def new_posts(st):
-    """خبرهای تازه را بدون مرحله تأیید مستقیماً در کانال منتشر می‌کند."""
+def _mark_seen(st, seen, iid):
+    if iid not in seen:
+        seen.add(iid)
+        st["seen"].append(iid)
+
+
+def new_posts(st, since):
+    """جدیدترین خبرهای بعد از زمان `since` رو انتخاب و منتشر می‌کنه (حداکثر POSTS_PER_SLOT تا)."""
     seen = set(st["seen"])
     now = datetime.now(timezone.utc)
     items = fetch_all(seen)
@@ -416,28 +530,22 @@ def new_posts(st):
         if it["id"] in seen:
             continue
         pub = it["published"]
-        if pub and now - pub > timedelta(hours=MAX_AGE_HOURS):
-            seen.add(it["id"])
-            st["seen"].append(it["id"])
-            continue
-        if EXCLUDE_TITLE.search(it["title"]):
-            seen.add(it["id"])
-            st["seen"].append(it["id"])
+        if (pub and pub < since) or EXCLUDE_TITLE.search(it["title"]):
+            _mark_seen(st, seen, it["id"])      # قدیمی یا نامرتبط: دیگه بررسی نشه
             continue
         fresh.append(it)
 
-    fresh.sort(key=lambda i: i["published"] or now)
-    sent = 0
-    for it in fresh:
-        if sent >= MAX_NEW_PER_RUN:
-            break
-        tk = tokens(it["title"])
-        if tk and any(is_similar(tk, old) for old in st["titles"]):
-            print("  duplicate story, skipped:", it["title"])
-            seen.add(it["id"])
-            st["seen"].append(it["id"])
-            continue
+    fresh.sort(key=lambda i: i["published"] or now, reverse=True)    # جدیدترین اول
 
+    chosen, failed, round_tokens = [], set(), []
+    for it in fresh:
+        if len(chosen) >= POSTS_PER_SLOT:
+            break
+        known = st["titles"] + round_tokens
+        tk = tokens(it["title"])
+        if tk and any(is_similar(tk, old) for old in known):
+            print("  duplicate story, skipped:", it["title"])
+            continue
         try:
             if it.get("language") == "fa" or it.get("source") == "F1Iran":
                 # خبر F1Iran از ابتدا فارسی است؛ دوباره از مترجم عبور نمی‌کند.
@@ -449,30 +557,116 @@ def new_posts(st):
                     summary_en = ""
                 fa_title, fa_summary = translate(it["title"], summary_en)
         except Exception as e:
-            print("  preparing news failed, will retry next run:", e)
+            print("  preparing news failed, will retry later:", e)
+            failed.add(it["id"])
             continue
-
         if not fa_title:
+            failed.add(it["id"])
             continue
-        # تشخیص خبر تکراری بین منبع انگلیسی و فارسی با مقایسه عنوان فارسی‌شده
         fa_tokens = tokens(fa_title)
-        if fa_tokens and any(is_similar(fa_tokens, old) for old in st["titles"]):
+        if fa_tokens and any(is_similar(fa_tokens, old) for old in known):
             print("  translated duplicate story, skipped:", fa_title)
-            seen.add(it["id"])
-            st["seen"].append(it["id"])
             continue
+        chosen.append({"it": it, "fa_title": fa_title, "fa_summary": fa_summary,
+                       "tk": tk, "fa_tokens": fa_tokens})
+        round_tokens += [t for t in (tk, fa_tokens) if t]
+
+    chosen_ids = {c["it"]["id"] for c in chosen}
+    for it in fresh:            # بقیه خبرها (انتخاب‌نشده/تکراری) برای نوبت بعد نمی‌مونن
+        if it["id"] not in chosen_ids and it["id"] not in failed:
+            _mark_seen(st, seen, it["id"])
+
+    published = 0
+    for c in reversed(chosen):          # قدیمی‌تر اول، تا جدیدترین خبر آخر کانال باشه
+        it = c["it"]
         image = it.get("image") or og_image(it["link"])
-        caption = build_caption(fa_title, fa_summary, it["source"], it["link"])
+        caption = build_caption(c["fa_title"], c["fa_summary"], it["source"], it["link"])
         mid = publish_post(caption, image)
         if mid:
-            sent += 1
-            seen.add(it["id"])
-            st["seen"].append(it["id"])
-            if fa_tokens:
-                st["titles"].append(fa_tokens)
+            published += 1
+            _mark_seen(st, seen, it["id"])
+            st["titles"] += [t for t in (c["tk"], c["fa_tokens"]) if t]
             print("  published:", it["title"], "(message", mid, ")")
             save_state(st)
-    return sent
+            time.sleep(2)
+    return published
+
+
+# ====================== فرمان‌های روشن / خاموش ======================
+
+HELP = ("/news_off ← خاموش کردن بخش خبر\n"
+        "/news_on ← روشن کردن بخش خبر\n"
+        "/news_status ← وضعیت فعلی")
+
+
+def _parse_iso(x):
+    try:
+        d = datetime.fromisoformat(x)
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _fmt_iran(dt):
+    return dt.astimezone(IRAN).strftime("%m/%d %H:%M")
+
+
+def status_text(st):
+    on = st.get("enabled", True)
+    lines = [f"وضعیت بخش خبر: {'🟢 روشن' if on else '🔴 خاموش'}"]
+    last = _parse_iso(st.get("last_post", ""))
+    if last:
+        lines.append(f"آخرین انتشار: {_fmt_iran(last)} (به وقت ایران)")
+    if on:
+        if last:
+            lines.append("انتشار بعدی: بعد از " + _fmt_iran(last + timedelta(hours=POST_INTERVAL_HOURS)))
+        else:
+            lines.append("انتشار بعدی: در اولین اجرا")
+    lines.append(f"تنظیم: هر {POST_INTERVAL_HOURS:g} ساعت، {POSTS_PER_SLOT} خبر")
+    return "\n".join(lines)
+
+
+def _reply(chat_id, text):
+    tg("sendMessage", {"chat_id": chat_id, "text": text})
+
+
+def process_commands(st):
+    if not ADMIN_CHAT_ID:
+        return
+    r = tg("getUpdates", {"offset": st["offset"], "timeout": 0,
+                          "allowed_updates": json.dumps(["message"])}, timeout=20)
+    if not r.get("ok"):
+        print("getUpdates failed:", r.get("description"))
+        return
+    now = time.time()
+    for upd in r.get("result", []):
+        st["offset"] = upd["update_id"] + 1
+        msg = upd.get("message") or {}
+        chat_id = msg.get("chat", {}).get("id")
+        if str(chat_id) != str(ADMIN_CHAT_ID):
+            continue                                   # فقط ادمین
+        if now - msg.get("date", now) > 12 * 3600:
+            continue                                   # فرمان خیلی قدیمی
+        words = (msg.get("text") or "").strip().split()
+        cmd = words[0].split("@")[0].lower() if words else ""
+        if cmd == "/news_off":
+            st["enabled"] = False
+            _reply(chat_id, "🔴 بخش خبر خاموش شد. تا /news_on نزنی خبری منتشر نمی‌شه.")
+            print("news turned OFF by admin")
+        elif cmd == "/news_on":
+            st["enabled"] = True
+            _reply(chat_id, "🟢 بخش خبر روشن شد. در اولین نوبت خبرهای جدید منتشر می‌شن.")
+            print("news turned ON by admin")
+        elif cmd == "/news_status":
+            _reply(chat_id, status_text(st))
+        elif cmd in ("/start", "/id", "/help"):
+            _reply(chat_id, f"Chat ID: {chat_id}\n\n{HELP}")
+    if not st.get("cmds_set"):
+        cmds = [{"command": "news_on", "description": "روشن کردن بخش خبر"},
+                {"command": "news_off", "description": "خاموش کردن بخش خبر"},
+                {"command": "news_status", "description": "وضعیت بخش خبر"}]
+        r = tg("setMyCommands", {"commands": json.dumps(cmds)})
+        st["cmds_set"] = bool(r.get("ok"))
 
 
 # ====================== اجرا ======================
@@ -484,7 +678,19 @@ def check_mode():
     for it in items[:12]:
         print(f"- [{it['source']}] {it['title'][:80]} | image={'yes' if it['image'] else 'no'}"
               f" | {it['published']}")
-    print("Translation test:", google_tr("Hamilton leads practice") or "(empty)")
+    sample = next((i for i in items if i["source"] != "F1Iran"), None)
+    if sample:
+        try:
+            t, sm = translate(sample["title"], make_summary(sample["summary_raw"]))
+            print("Translation provider:", LAST_PROVIDER)
+            print("EN:", sample["title"])
+            print("FA:", t)
+            print("FA summary:", sm)
+        except Exception as e:
+            print("Translation FAILED:", e)
+    else:
+        print("Translation test:", google_tr("Hamilton leads practice") or "(empty)")
+    print(status_text(st))
 
 
 def test_mode():
@@ -501,11 +707,29 @@ def main():
         sys.exit(1)
     if mode == "check":
         return check_mode()
-    st = load_state()
     if mode == "test":
-        test_mode()
+        return test_mode()
+
+    st = load_state()
+    process_commands(st)
+    now = datetime.now(timezone.utc)
+
+    if not st.get("enabled", True):
+        print("بخش خبر خاموش است (با /news_on روشن می‌شود).")
+        save_state(st)
         return
-    count = new_posts(st)
+
+    interval = timedelta(hours=POST_INTERVAL_HOURS)
+    last = _parse_iso(st.get("last_post", ""))
+    if mode != "now" and last and now - last < interval:
+        print("هنوز نوبت انتشار نرسیده؛ بعدی بعد از", _fmt_iran(last + interval))
+        save_state(st)
+        return
+
+    since = max(last or (now - interval), now - timedelta(hours=MAX_WINDOW_HOURS))
+    count = new_posts(st, since)
+    if count:
+        st["last_post"] = datetime.now(timezone.utc).isoformat()
     print(f"Published {count} new posts.")
     save_state(st)
 
