@@ -37,7 +37,8 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")     # آیدی عددی خو
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # اگه مدلی خطا یا محدودیت داد، بعدی امتحان می‌شه؛ اگه همه نبودن، لیست مدل‌ها از خود گوگل پرسیده می‌شه
 GEMINI_MODELS = [m for m in os.environ.get(
-    "GEMINI_MODELS", "gemini-2.5-flash,gemini-flash-latest,gemini-2.5-flash-lite,gemini-2.0-flash"
+    "GEMINI_MODELS",
+    "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemma-4-31b-it,gemini-flash-latest"
 ).split(",") if m]
 IRAN = timezone(timedelta(hours=3, minutes=30))
 
@@ -393,34 +394,51 @@ def _parse_tr_json(text):
     return obj["title"].strip(), (obj.get("summary") or "").strip()
 
 
+def _gemini_body(model, prompt):
+    cfg = {"temperature": 0.3}
+    if not model.startswith("gemma"):          # مدل‌های Gemma حالت JSON رو پشتیبانی نمی‌کنن
+        cfg["responseMimeType"] = "application/json"
+    return json.dumps({"contents": [{"parts": [{"text": prompt}]}],
+                       "generationConfig": cfg}).encode()
+
+
 def _gemini_call(model, prompt):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3},
-    }).encode()
     req = urllib.request.Request(
-        url, data=body,
+        url, data=_gemini_body(model, prompt),
         headers={"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"})
     with _opener().open(req, timeout=60) as r:
         resp = json.loads(r.read().decode())
     return resp["candidates"][0]["content"]["parts"][0]["text"]
 
 
+def _http_error_text(e):
+    try:
+        body = e.read().decode("utf-8", "ignore")
+        msg = json.loads(body).get("error", {}).get("message", body)
+    except Exception:
+        msg = ""
+    return f"HTTP {e.code} {msg[:160]}".strip()
+
+
 def _gemini_discover():
-    # اگه اسم مدل‌ها عوض شده باشه، مدل‌های flash فعلی رو از خود گوگل می‌پرسه
+    # اگه اسم مدل‌ها عوض شده باشه، مدل‌های فعلی رو از خود گوگل می‌پرسه
     req = urllib.request.Request(
-        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100",
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
         headers={"x-goog-api-key": GEMINI_API_KEY})
     with _opener().open(req, timeout=30) as r:
         data = json.loads(r.read().decode())
     names = []
     for m in data.get("models", []):
         n = m.get("name", "").replace("models/", "")
-        if ("flash" in n and "generateContent" in m.get("supportedGenerationMethods", [])
-                and not re.search(r"image|tts|live|audio|embedding|thinking|exp", n)):
+        if (re.search(r"flash|gemma", n)
+                and "generateContent" in m.get("supportedGenerationMethods", [])
+                and not re.search(r"image|tts|live|audio|embedding|thinking|exp|omni|robotics|"
+                                  r"computer|vision|preview-\d", n)):
             names.append(n)
-    return sorted(names, reverse=True)[:3]
+    names = sorted(names, reverse=True)[:6]
+    print("  Gemini models found:", ", ".join(names) or "(none)")
+    return names
 
 
 def gemini_tr(title, summary):
@@ -432,15 +450,22 @@ def gemini_tr(title, summary):
             if model in tried or model in _BAD_MODELS:
                 continue
             tried.append(model)
-            try:
-                t, sm = _parse_tr_json(_gemini_call(model, prompt))
-                return t, sm, model
-            except urllib.error.HTTPError as e:
-                last = f"{model}: HTTP {e.code}"
-                _BAD_MODELS.add(model)
-            except Exception as e:
-                last = f"{model}: {e}"
-            print("  Gemini failed ->", last)
+            for retry in range(3):
+                try:
+                    t, sm = _parse_tr_json(_gemini_call(model, prompt))
+                    return t, sm, model
+                except urllib.error.HTTPError as e:
+                    last = f"{model}: {_http_error_text(e)}"
+                    print("  Gemini failed ->", last)
+                    if e.code == 503 and retry < 2:      # شلوغی موقت: کمی صبر و تلاش دوباره
+                        time.sleep(4 * (retry + 1))
+                        continue
+                    _BAD_MODELS.add(model)
+                    break
+                except Exception as e:
+                    last = f"{model}: {e}"
+                    print("  Gemini failed ->", last)
+                    break
         if attempt == 0:
             try:
                 candidates = _gemini_discover()
@@ -448,6 +473,25 @@ def gemini_tr(title, summary):
                 print("  Gemini model discovery failed:", e)
                 break
     raise RuntimeError(last or "gemini failed")
+
+
+LINGVA_HOSTS = ["lingva.ml", "lingva.garudalinux.org", "translate.plausibility.cloud"]
+
+
+def lingva_tr(text):
+    # فال‌بک رایگان دوم، وقتی مترجم گوگل به سرورهای گیت‌هاب 429 می‌ده
+    if not text:
+        return ""
+    last = None
+    for host in LINGVA_HOSTS:
+        try:
+            url = f"https://{host}/api/v1/en/fa/" + urllib.parse.quote(text, safe="")
+            data = json.loads(http_get(url, timeout=20).decode("utf-8"))
+            if data.get("translation"):
+                return data["translation"].strip()
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"Lingva هم پاسخ نداد: {last}")
 
 
 def translate(title, summary):
@@ -460,8 +504,15 @@ def translate(title, summary):
                 return t, sm
         except Exception as e:
             print("Gemini translation failed, falling back to Google Translate:", e)
-    LAST_PROVIDER = "Google Translate (رایگان، کیفیت پایین‌تر)"
-    return polish_f1_translation(google_tr(title)), polish_f1_translation(google_tr(summary))
+    try:
+        res = polish_f1_translation(google_tr(title)), polish_f1_translation(google_tr(summary))
+        LAST_PROVIDER = "Google Translate (رایگان، کیفیت پایین‌تر)"
+        return res
+    except Exception as e:
+        print("Google Translate failed, trying Lingva:", e)
+    res = polish_f1_translation(lingva_tr(title)), polish_f1_translation(lingva_tr(summary))
+    LAST_PROVIDER = "Lingva (رایگان، کیفیت پایین‌تر)"
+    return res
 
 
 # ====================== ساخت پست ======================
