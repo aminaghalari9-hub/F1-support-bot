@@ -38,7 +38,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # اگه مدلی خطا یا محدودیت داد، بعدی امتحان می‌شه؛ اگه همه نبودن، لیست مدل‌ها از خود گوگل پرسیده می‌شه
 GEMINI_MODELS = [m for m in os.environ.get(
     "GEMINI_MODELS",
-    "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemma-4-31b-it,gemini-flash-latest"
+    "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.6-flash,gemma-4-31b-it,gemini-flash-latest"
 ).split(",") if m]
 IRAN = timezone(timedelta(hours=3, minutes=30))
 
@@ -331,14 +331,15 @@ def google_tr(text):
     url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode(
         {"client": "gtx", "sl": "en", "tl": "fa", "dt": "t", "q": text})
     last_error = None
-    for attempt in range(3):
+    for attempt in range(2):
+        _check_time()
         try:
-            data = json.loads(http_get(url, timeout=30).decode("utf-8"))
+            data = json.loads(http_get(url, timeout=12).decode("utf-8"))
             return "".join(seg[0] for seg in data[0] if seg and seg[0]).strip()
         except Exception as e:
             last_error = e
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
+            if attempt < 1:
+                time.sleep(1)
     raise RuntimeError(f"Google Translate موقتاً پاسخ نداد: {last_error}")
 
 
@@ -386,6 +387,13 @@ TRANSLATE_PROMPT = (
     '"summary": "راننده فراری پس از استفاده از موتور جدید از انتهای گرید استارت می‌زند."}\n\n')
 
 LAST_PROVIDER = ""
+TRANSLATE_BUDGET = 40         # حداکثر ثانیه برای ترجمه‌ی هر خبر، بعدش تسلیم می‌شه
+_TR_DEADLINE = 0.0
+
+
+def _check_time():
+    if _TR_DEADLINE and time.time() > _TR_DEADLINE:
+        raise TimeoutError("زمان ترجمه تموم شد")
 _BAD_MODELS = set()      # مدل‌هایی که در این اجرا خطا دادن؛ دوباره امتحان نمی‌شن
 
 
@@ -407,7 +415,7 @@ def _gemini_call(model, prompt):
     req = urllib.request.Request(
         url, data=_gemini_body(model, prompt),
         headers={"x-goog-api-key": GEMINI_API_KEY, "content-type": "application/json"})
-    with _opener().open(req, timeout=60) as r:
+    with _opener().open(req, timeout=20) as r:
         resp = json.loads(r.read().decode())
     return resp["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -426,7 +434,7 @@ def _gemini_discover():
     req = urllib.request.Request(
         "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
         headers={"x-goog-api-key": GEMINI_API_KEY})
-    with _opener().open(req, timeout=30) as r:
+    with _opener().open(req, timeout=15) as r:
         data = json.loads(r.read().decode())
     names = []
     for m in data.get("models", []):
@@ -447,18 +455,20 @@ def gemini_tr(title, summary):
     candidates = list(GEMINI_MODELS)
     for attempt in range(2):
         for model in candidates:
+            _check_time()
             if model in tried or model in _BAD_MODELS:
                 continue
             tried.append(model)
-            for retry in range(3):
+            for retry in range(2):
+                _check_time()
                 try:
                     t, sm = _parse_tr_json(_gemini_call(model, prompt))
                     return t, sm, model
                 except urllib.error.HTTPError as e:
                     last = f"{model}: {_http_error_text(e)}"
                     print("  Gemini failed ->", last)
-                    if e.code == 503 and retry < 2:      # شلوغی موقت: کمی صبر و تلاش دوباره
-                        time.sleep(4 * (retry + 1))
+                    if e.code == 503 and retry < 1:      # شلوغی موقت: کمی صبر و یک تلاش دوباره
+                        time.sleep(3)
                         continue
                     _BAD_MODELS.add(model)
                     break
@@ -485,8 +495,9 @@ def lingva_tr(text):
     last = None
     for host in LINGVA_HOSTS:
         try:
+            _check_time()
             url = f"https://{host}/api/v1/en/fa/" + urllib.parse.quote(text, safe="")
-            data = json.loads(http_get(url, timeout=20).decode("utf-8"))
+            data = json.loads(http_get(url, timeout=8).decode("utf-8"))
             if data.get("translation"):
                 return data["translation"].strip()
         except Exception as e:
@@ -495,7 +506,8 @@ def lingva_tr(text):
 
 
 def translate(title, summary):
-    global LAST_PROVIDER
+    global LAST_PROVIDER, _TR_DEADLINE
+    _TR_DEADLINE = time.time() + TRANSLATE_BUDGET
     if GEMINI_API_KEY:
         try:
             t, sm, model = gemini_tr(title, summary)
@@ -589,8 +601,13 @@ def new_posts(st, since):
     fresh.sort(key=lambda i: i["published"] or now, reverse=True)    # جدیدترین اول
 
     chosen, failed, round_tokens = [], set(), []
-    for it in fresh:
+    t_start, fails_in_row = time.time(), 0
+    for idx, it in enumerate(fresh):
         if len(chosen) >= POSTS_PER_SLOT:
+            break
+        if fails_in_row >= 2 or time.time() - t_start > 150:
+            print("  ترجمه جواب نمی‌ده؛ بقیه‌ی خبرها به اجرای بعدی موکول شد.")
+            failed.update(x["id"] for x in fresh[idx:])     # دیده‌شده ثبت نشن، بعداً دوباره امتحان بشن
             break
         known = st["titles"] + round_tokens
         tk = tokens(it["title"])
@@ -610,10 +627,13 @@ def new_posts(st, since):
         except Exception as e:
             print("  preparing news failed, will retry later:", e)
             failed.add(it["id"])
+            fails_in_row += 1
             continue
         if not fa_title:
             failed.add(it["id"])
+            fails_in_row += 1
             continue
+        fails_in_row = 0
         fa_tokens = tokens(fa_title)
         if fa_tokens and any(is_similar(fa_tokens, old) for old in known):
             print("  translated duplicate story, skipped:", fa_title)
